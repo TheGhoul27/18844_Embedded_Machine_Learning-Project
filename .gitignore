@@ -1,3 +1,6 @@
 /.vscode
 split_records/*
 artifacts_part1
+*.png
+*.jpg
+*.jpeg
