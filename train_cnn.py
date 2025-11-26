@@ -741,6 +741,89 @@ class CNNBiLSTMRegressor(nn.Module):
 
         out = self.fc(last)           # (B, 2)
         return out
+    
+class AttentionBlock(nn.Module):
+    """
+    Additive attention over sequence: produces a weighted sum of LSTM outputs.
+    input:  (B, T, H)
+    output: (B, H)
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.W = nn.Linear(hidden_dim, hidden_dim)
+        self.v = nn.Linear(hidden_dim, 1, bias=False)
+
+    def forward(self, h):
+        # h: (B, T, H)
+        score = self.v(torch.tanh(self.W(h)))   # (B, T, 1)
+        weights = torch.softmax(score, dim=1)   # importance weights
+        context = (weights * h).sum(dim=1)      # weighted sum → (B, H)
+        return context, weights
+
+
+class CNNBiLSTMAttentionRegressor(nn.Module):
+    """
+    CNN + BiLSTM + Additive Attention → regression head.
+    Output = standardized [SBP, DBP].
+    """
+    def __init__(self,
+                 num_conv_channels=64,
+                 lstm_hidden=64,
+                 lstm_layers=1,
+                 bidirectional=True,
+                 dropout=0.3):
+        super().__init__()
+
+        # CNN feature extractor
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+
+            nn.Conv1d(32, num_conv_channels, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+
+            nn.Conv1d(num_conv_channels, num_conv_channels, kernel_size=5, padding=2),
+            nn.ReLU(),
+        )
+
+        self.bidirectional = bidirectional
+        num_dirs = 2 if bidirectional else 1
+        lstm_input_size = num_conv_channels
+        lstm_output_size = lstm_hidden * num_dirs
+
+        # BiLSTM
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_size,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+        )
+
+        # Attention
+        self.attention = AttentionBlock(lstm_output_size)
+
+        # Final regression head
+        self.fc = nn.Sequential(
+            nn.Linear(lstm_output_size, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        # x: (B, 1, T_raw)
+        h = self.conv(x)          # (B, C, T_cnn)
+        h = h.transpose(1, 2)     # (B, T_cnn, C)
+
+        lstm_out, _ = self.lstm(h)   # (B, T_cnn, H_out)
+        context, attn_weights = self.attention(lstm_out)  # (B, H_out)
+
+        out = self.fc(context)
+        return out
 
 # ==================== TRAIN / EVAL ====================
 
@@ -766,7 +849,8 @@ def train_model(X, y):
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
 
-    model = CNNBiLSTMRegressor().to(DEVICE)
+    # model = CNNBiLSTMRegressor().to(DEVICE)
+    model = CNNBiLSTMAttentionRegressor().to(DEVICE)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
